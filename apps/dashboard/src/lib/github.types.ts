@@ -65,6 +65,8 @@ export type PullDetail = PullSummary & {
 	headSha: string;
 	baseRefName: string;
 	isMerged: boolean;
+	mergeCommitSha: string | null;
+	mergedBy: GitHubActor | null;
 	mergeable: boolean | null;
 	mergeableState?: string | null;
 	requestedReviewers: GitHubActor[];
@@ -135,6 +137,9 @@ export type PullCheckRun = {
 	name: string;
 	status: string;
 	conclusion: string | null;
+	appAvatarUrl: string | null;
+	outputTitle: string | null;
+	startedAt: string | null;
 };
 
 export type PullReview = {
@@ -152,11 +157,13 @@ export type PullStatus = {
 		pending: number;
 		skipped: number;
 	};
+	checkRuns: PullCheckRun[];
 	mergeable: boolean | null;
 	mergeableState: string | null;
 	behindBy: number | null;
 	baseRefName: string;
 	canUpdateBranch: boolean;
+	canBypassProtections: boolean;
 };
 
 export type PullCommit = {
