@@ -1,7 +1,9 @@
 import { infiniteQueryOptions, queryOptions } from "@tanstack/react-query";
 import {
 	type CommandPaletteSearchInput,
+	getBranchComparison,
 	getCommentPage,
+	getCompareDetail,
 	getFileLastCommit,
 	getGitHubViewer,
 	getIssueComments,
@@ -23,6 +25,7 @@ import {
 	getPullStatus,
 	getPullsFromRepo,
 	getPullsFromUser,
+	getRecentPushableBranch,
 	getRefHeadCommit,
 	getRepoBranches,
 	getRepoCollaborators,
@@ -34,6 +37,7 @@ import {
 	getRepoOverview,
 	getRepoParticipationStats,
 	getReposHub,
+	getRepoTemplate,
 	getRepoTree,
 	getReviewThreadStatuses,
 	getTimelineEventPage,
@@ -43,6 +47,7 @@ import {
 	getUserPinnedRepos,
 	getUserProfile,
 	getUserRepos,
+	type RepoTemplateKind,
 	searchCommandPaletteGitHub,
 } from "./github.functions";
 import { githubCachePolicy } from "./github-cache-policy";
@@ -204,6 +209,23 @@ export const githubQueryKeys = {
 			scope: GitHubQueryScope,
 			input: { owner: string; repo: string },
 		) => ["github", scope.userId, "repo", "branches", input] as const,
+		branchComparison: (
+			scope: GitHubQueryScope,
+			input: { owner: string; repo: string; base: string; head: string },
+		) => ["github", scope.userId, "repo", "branchComparison", input] as const,
+		compareDetail: (
+			scope: GitHubQueryScope,
+			input: { owner: string; repo: string; base: string; head: string },
+		) => ["github", scope.userId, "repo", "compareDetail", input] as const,
+		recentPushableBranch: (
+			scope: GitHubQueryScope,
+			input: { owner: string; repo: string },
+		) =>
+			["github", scope.userId, "repo", "recentPushableBranch", input] as const,
+		template: (
+			scope: GitHubQueryScope,
+			input: { owner: string; repo: string; kind: RepoTemplateKind },
+		) => ["github", scope.userId, "repo", "template", input] as const,
 		tree: (
 			scope: GitHubQueryScope,
 			input: { owner: string; repo: string; ref: string; path: string },
@@ -683,6 +705,57 @@ export function githubRepoBranchesQueryOptions(
 	return queryOptions({
 		queryKey: githubQueryKeys.repo.branches(scope, input),
 		queryFn: () => getRepoBranches({ data: input }),
+		staleTime: githubCachePolicy.repoMeta.staleTimeMs,
+		gcTime: githubCachePolicy.repoMeta.gcTimeMs,
+		meta: persistedMeta,
+	});
+}
+
+export function githubBranchComparisonQueryOptions(
+	scope: GitHubQueryScope,
+	input: { owner: string; repo: string; base: string; head: string },
+) {
+	return queryOptions({
+		queryKey: githubQueryKeys.repo.branchComparison(scope, input),
+		queryFn: () => getBranchComparison({ data: input }),
+		staleTime: githubCachePolicy.detail.staleTimeMs,
+		gcTime: githubCachePolicy.detail.gcTimeMs,
+		meta: tabPersistedMeta,
+	});
+}
+
+export function githubCompareDetailQueryOptions(
+	scope: GitHubQueryScope,
+	input: { owner: string; repo: string; base: string; head: string },
+) {
+	return queryOptions({
+		queryKey: githubQueryKeys.repo.compareDetail(scope, input),
+		queryFn: () => getCompareDetail({ data: input }),
+		staleTime: githubCachePolicy.detail.staleTimeMs,
+		gcTime: githubCachePolicy.detail.gcTimeMs,
+		meta: tabPersistedMeta,
+	});
+}
+
+export function githubRecentPushableBranchQueryOptions(
+	scope: GitHubQueryScope,
+	input: { owner: string; repo: string },
+) {
+	return queryOptions({
+		queryKey: githubQueryKeys.repo.recentPushableBranch(scope, input),
+		queryFn: () => getRecentPushableBranch({ data: input }),
+		staleTime: githubCachePolicy.detail.staleTimeMs,
+		gcTime: githubCachePolicy.detail.gcTimeMs,
+	});
+}
+
+export function githubRepoTemplateQueryOptions(
+	scope: GitHubQueryScope,
+	input: { owner: string; repo: string; kind: RepoTemplateKind },
+) {
+	return queryOptions({
+		queryKey: githubQueryKeys.repo.template(scope, input),
+		queryFn: () => getRepoTemplate({ data: input }),
 		staleTime: githubCachePolicy.repoMeta.staleTimeMs,
 		gcTime: githubCachePolicy.repoMeta.gcTimeMs,
 		meta: persistedMeta,

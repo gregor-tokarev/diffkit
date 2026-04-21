@@ -2,6 +2,7 @@ import { createServerFn } from "@tanstack/react-start";
 import { type Octokit as OctokitType, RequestError } from "octokit";
 import { debug } from "./debug";
 import type {
+	BranchComparison,
 	CommandPaletteSearchResult,
 	CommentReactionContent,
 	CommentReactionSummary,
@@ -7179,6 +7180,99 @@ export type CreateIssueResult =
 	| { ok: true; issueNumber: number }
 	| { ok: false; error: string; installUrl?: string };
 
+export type CreatePullRequestInput = {
+	owner: string;
+	repo: string;
+	title: string;
+	body?: string;
+	base: string;
+	head: string;
+	draft?: boolean;
+	labels?: string[];
+	assignees?: string[];
+	reviewers?: string[];
+	teamReviewers?: string[];
+};
+
+export type CreatePullRequestResult =
+	| { ok: true; pullNumber: number }
+	| { ok: false; error: string; installUrl?: string };
+
+export const createPullRequest = createServerFn({ method: "POST" })
+	.inputValidator(identityValidator<CreatePullRequestInput>)
+	.handler(async ({ data }): Promise<CreatePullRequestResult> => {
+		const context = await getGitHubUserContextForRepository(data);
+		if (!context) {
+			return { ok: false, error: "Not authenticated" };
+		}
+
+		try {
+			const response = await context.octokit.rest.pulls.create({
+				owner: data.owner,
+				repo: data.repo,
+				title: data.title,
+				body: data.body,
+				base: data.base,
+				head: data.head,
+				draft: data.draft ?? false,
+			});
+
+			const pullNumber = response.data.number;
+
+			const followUps: Array<Promise<unknown>> = [];
+			if (data.labels && data.labels.length > 0) {
+				followUps.push(
+					context.octokit.rest.issues.addLabels({
+						owner: data.owner,
+						repo: data.repo,
+						issue_number: pullNumber,
+						labels: data.labels,
+					}),
+				);
+			}
+			if (data.assignees && data.assignees.length > 0) {
+				followUps.push(
+					context.octokit.rest.issues.addAssignees({
+						owner: data.owner,
+						repo: data.repo,
+						issue_number: pullNumber,
+						assignees: data.assignees,
+					}),
+				);
+			}
+			if (
+				(data.reviewers && data.reviewers.length > 0) ||
+				(data.teamReviewers && data.teamReviewers.length > 0)
+			) {
+				followUps.push(
+					context.octokit.rest.pulls.requestReviewers({
+						owner: data.owner,
+						repo: data.repo,
+						pull_number: pullNumber,
+						reviewers: data.reviewers ?? [],
+						team_reviewers: data.teamReviewers ?? [],
+					}),
+				);
+			}
+			if (followUps.length > 0) {
+				await Promise.allSettled(followUps);
+			}
+
+			await bumpGitHubCacheNamespaces([
+				githubRevalidationSignalKeys.pullsMine,
+				githubRevalidationSignalKeys.repoMeta({
+					owner: data.owner,
+					repo: data.repo,
+				}),
+			]);
+
+			return { ok: true, pullNumber };
+		} catch (error) {
+			const result = toMutationError("create pull request", error);
+			return { ok: false, error: result.ok ? "" : result.error };
+		}
+	});
+
 export const createIssue = createServerFn({ method: "POST" })
 	.inputValidator(identityValidator<CreateIssueInput>)
 	.handler(async ({ data }): Promise<CreateIssueResult> => {
@@ -8344,6 +8438,340 @@ export const getRepoBranches = createServerFn({ method: "GET" })
 					isProtected: b.protected,
 				})),
 		});
+	});
+
+// ---------------------------------------------------------------------------
+// Branch comparison (ahead/behind vs base branch)
+// ---------------------------------------------------------------------------
+
+type BranchComparisonInput = {
+	owner: string;
+	repo: string;
+	base: string;
+	head: string;
+};
+
+export const getBranchComparison = createServerFn({ method: "GET" })
+	.inputValidator(identityValidator<BranchComparisonInput>)
+	.handler(async ({ data }): Promise<BranchComparison | null> => {
+		if (data.base === data.head) return null;
+		const context = await getGitHubContextForRepository(data);
+		if (!context) return null;
+
+		return getCachedGitHubRequest<
+			Awaited<
+				ReturnType<GitHubClient["rest"]["repos"]["compareCommitsWithBasehead"]>
+			>["data"],
+			BranchComparison
+		>({
+			context,
+			resource: "repo.branchComparison.v1",
+			params: data,
+			freshForMs: githubCachePolicy.detail.staleTimeMs,
+			signalKeys: [githubRevalidationSignalKeys.repoCode(data)],
+			namespaceKeys: [githubRevalidationSignalKeys.repoCode(data)],
+			cacheMode: "split",
+			request: (headers) =>
+				context.octokit.rest.repos.compareCommitsWithBasehead({
+					owner: data.owner,
+					repo: data.repo,
+					basehead: `${data.base}...${data.head}`,
+					per_page: 1,
+					headers,
+				}),
+			mapData: (comparison) => ({
+				aheadBy: comparison.ahead_by,
+				behindBy: comparison.behind_by,
+				status: comparison.status as BranchComparison["status"],
+				totalCommits: comparison.total_commits,
+			}),
+		}).catch(() => null);
+	});
+
+// ---------------------------------------------------------------------------
+// Repo templates — PR / issue body templates (single-file, simple case only).
+// ---------------------------------------------------------------------------
+
+export type RepoTemplateKind = "pr" | "issue";
+
+type RepoTemplateInput = {
+	owner: string;
+	repo: string;
+	kind: RepoTemplateKind;
+};
+
+const PR_TEMPLATE_PATHS = [
+	".github/pull_request_template.md",
+	".github/PULL_REQUEST_TEMPLATE.md",
+	"docs/pull_request_template.md",
+	"docs/PULL_REQUEST_TEMPLATE.md",
+	"pull_request_template.md",
+	"PULL_REQUEST_TEMPLATE.md",
+];
+
+const ISSUE_TEMPLATE_PATHS = [
+	".github/ISSUE_TEMPLATE.md",
+	".github/issue_template.md",
+	"docs/ISSUE_TEMPLATE.md",
+	"docs/issue_template.md",
+	"ISSUE_TEMPLATE.md",
+	"issue_template.md",
+];
+
+type RepoTemplateGraphQLResponse = {
+	repository: {
+		[alias: string]: { text: string | null } | null;
+	} | null;
+};
+
+export const getRepoTemplate = createServerFn({ method: "GET" })
+	.inputValidator(identityValidator<RepoTemplateInput>)
+	.handler(async ({ data }): Promise<string | null> => {
+		const context = await getGitHubContextForRepository(data);
+		if (!context) return null;
+
+		const repoCodeKey = githubRevalidationSignalKeys.repoCode({
+			owner: data.owner,
+			repo: data.repo,
+		});
+
+		try {
+			return await getOrRevalidateGitHubResource<string | null>({
+				userId: context.session.user.id,
+				resource: `repo.template.${data.kind}.v1`,
+				params: data,
+				freshForMs: githubCachePolicy.repoMeta.staleTimeMs,
+				signalKeys: [repoCodeKey],
+				namespaceKeys: [repoCodeKey],
+				cacheMode: "split",
+				fetcher: async () => {
+					const paths =
+						data.kind === "pr" ? PR_TEMPLATE_PATHS : ISSUE_TEMPLATE_PATHS;
+					const fields = paths
+						.map(
+							(path, i) =>
+								`p${i}: object(expression: "HEAD:${path}") { ... on Blob { text } }`,
+						)
+						.join("\n");
+
+					const response =
+						await executeGitHubGraphQL<RepoTemplateGraphQLResponse>(
+							context,
+							`github repo template ${data.kind} ${data.owner}/${data.repo}`,
+							`query($owner: String!, $repo: String!) {
+								repository(owner: $owner, name: $repo) {
+									${fields}
+								}
+							}`,
+							{ owner: data.owner, repo: data.repo },
+						);
+
+					const repository = response.repository;
+					let body: string | null = null;
+					if (repository) {
+						for (let i = 0; i < paths.length; i++) {
+							const entry = repository[`p${i}`];
+							const text = entry?.text;
+							if (text && text.length > 0) {
+								body = text;
+								break;
+							}
+						}
+					}
+
+					return {
+						kind: "success",
+						data: body,
+						metadata: createGitHubResponseMetadata(200, {}),
+					};
+				},
+			});
+		} catch {
+			return null;
+		}
+	});
+
+// ---------------------------------------------------------------------------
+// Recent pushable branch — viewer's most recent push to a non-default branch
+// that has no open PR and is ahead of the default branch. Used to render the
+// "had recent pushes" banner on the repo overview.
+// ---------------------------------------------------------------------------
+
+export type RecentPushableBranch = {
+	branch: string;
+	pushedAt: string;
+	aheadBy: number;
+};
+
+type RecentPushableBranchInput = {
+	owner: string;
+	repo: string;
+};
+
+export const getRecentPushableBranch = createServerFn({ method: "GET" })
+	.inputValidator(identityValidator<RecentPushableBranchInput>)
+	.handler(async ({ data }): Promise<RecentPushableBranch | null> => {
+		const context = await getGitHubContextForRepository(data);
+		if (!context) return null;
+
+		const repoCodeKey = githubRevalidationSignalKeys.repoCode(data);
+		const repoMetaKey = githubRevalidationSignalKeys.repoMeta(data);
+
+		try {
+			return await getOrRevalidateGitHubResource<RecentPushableBranch | null>({
+				userId: context.session.user.id,
+				resource: "repo.recentPushableBranch.v1",
+				params: data,
+				freshForMs: githubCachePolicy.detail.staleTimeMs,
+				signalKeys: [repoCodeKey, repoMetaKey],
+				namespaceKeys: [repoCodeKey, repoMetaKey],
+				cacheMode: "split",
+				fetcher: async () => {
+					const viewer = await getViewer(context);
+					if (!viewer.login) {
+						return {
+							kind: "success",
+							data: null,
+							metadata: createGitHubResponseMetadata(200, {}),
+						};
+					}
+
+					const overview = await context.octokit.rest.repos.get({
+						owner: data.owner,
+						repo: data.repo,
+					});
+					const defaultBranch = overview.data.default_branch;
+					if (!defaultBranch) {
+						return {
+							kind: "success",
+							data: null,
+							metadata: createGitHubResponseMetadata(200, {}),
+						};
+					}
+
+					const activities = await context.octokit.rest.repos.listActivities({
+						owner: data.owner,
+						repo: data.repo,
+						actor: viewer.login,
+						activity_type: "push",
+						time_period: "day",
+						per_page: 10,
+					});
+
+					const seen = new Set<string>();
+					for (const activity of activities.data) {
+						const ref = activity.ref;
+						if (!ref.startsWith("refs/heads/")) continue;
+						const branch = ref.slice("refs/heads/".length);
+						if (branch === defaultBranch) continue;
+						if (seen.has(branch)) continue;
+						seen.add(branch);
+
+						const existingPrs = await context.octokit.rest.pulls.list({
+							owner: data.owner,
+							repo: data.repo,
+							head: `${data.owner}:${branch}`,
+							state: "open",
+							per_page: 1,
+						});
+						if (existingPrs.data.length > 0) continue;
+
+						const comparison =
+							await context.octokit.rest.repos.compareCommitsWithBasehead({
+								owner: data.owner,
+								repo: data.repo,
+								basehead: `${defaultBranch}...${branch}`,
+								per_page: 1,
+							});
+						if (comparison.data.ahead_by === 0) continue;
+
+						return {
+							kind: "success",
+							data: {
+								branch,
+								pushedAt: activity.timestamp,
+								aheadBy: comparison.data.ahead_by,
+							},
+							metadata: createGitHubResponseMetadata(200, {}),
+						};
+					}
+
+					return {
+						kind: "success",
+						data: null,
+						metadata: createGitHubResponseMetadata(200, {}),
+					};
+				},
+			});
+		} catch {
+			return null;
+		}
+	});
+
+// ---------------------------------------------------------------------------
+// Compare detail (commits + files between two refs, for the compare page)
+// ---------------------------------------------------------------------------
+
+export type CompareDetail = {
+	aheadBy: number;
+	behindBy: number;
+	status: "ahead" | "behind" | "diverged" | "identical";
+	totalCommits: number;
+	commits: PullCommit[];
+	files: PullFile[];
+};
+
+export const getCompareDetail = createServerFn({ method: "GET" })
+	.inputValidator(identityValidator<BranchComparisonInput>)
+	.handler(async ({ data }): Promise<CompareDetail | null> => {
+		if (data.base === data.head) return null;
+		const context = await getGitHubContextForRepository(data);
+		if (!context) return null;
+
+		return getCachedGitHubRequest<
+			Awaited<
+				ReturnType<GitHubClient["rest"]["repos"]["compareCommitsWithBasehead"]>
+			>["data"],
+			CompareDetail
+		>({
+			context,
+			resource: "repo.compareDetail.v1",
+			params: data,
+			freshForMs: githubCachePolicy.detail.staleTimeMs,
+			signalKeys: [githubRevalidationSignalKeys.repoCode(data)],
+			namespaceKeys: [githubRevalidationSignalKeys.repoCode(data)],
+			cacheMode: "split",
+			request: (headers) =>
+				context.octokit.rest.repos.compareCommitsWithBasehead({
+					owner: data.owner,
+					repo: data.repo,
+					basehead: `${data.base}...${data.head}`,
+					per_page: 100,
+					headers,
+				}),
+			mapData: (comparison) => ({
+				aheadBy: comparison.ahead_by,
+				behindBy: comparison.behind_by,
+				status: comparison.status as CompareDetail["status"],
+				totalCommits: comparison.total_commits,
+				commits: comparison.commits.map((c) => ({
+					sha: c.sha,
+					message: c.commit.message,
+					createdAt: c.commit.committer?.date ?? c.commit.author?.date ?? "",
+					author: mapActor(c.author),
+				})),
+				files: (comparison.files ?? []).map((f) => ({
+					sha: f.sha ?? null,
+					filename: f.filename,
+					status: f.status as PullFile["status"],
+					additions: f.additions,
+					deletions: f.deletions,
+					changes: f.changes,
+					patch: f.patch ?? null,
+					previousFilename: f.previous_filename ?? null,
+				})),
+			}),
+		}).catch(() => null);
 	});
 
 // ---------------------------------------------------------------------------
