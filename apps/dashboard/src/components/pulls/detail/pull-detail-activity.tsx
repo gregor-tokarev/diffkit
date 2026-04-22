@@ -1,4 +1,5 @@
 import {
+	AlertCircleIcon,
 	CheckIcon,
 	ChevronDownIcon,
 	ChevronUpIcon,
@@ -37,6 +38,7 @@ import { MarkdownEditor } from "@diffkit/ui/components/markdown-editor";
 import { Skeleton } from "@diffkit/ui/components/skeleton";
 import { toast } from "@diffkit/ui/components/sonner";
 import { Spinner } from "@diffkit/ui/components/spinner";
+import { StatePill } from "@diffkit/ui/components/state-pill";
 import { quickhubDark, quickhubLight } from "@diffkit/ui/lib/diffs-themes";
 import { cn } from "@diffkit/ui/lib/utils";
 import type { DiffLineAnnotation, PatchDiffProps } from "@pierre/diffs/react";
@@ -48,6 +50,7 @@ import {
 	lazy,
 	Suspense,
 	useCallback,
+	useEffect,
 	useMemo,
 	useRef,
 	useState,
@@ -70,6 +73,7 @@ import { LabelPill } from "#/components/details/label-pill";
 import { useMergeBypass } from "#/components/pulls/detail/use-merge-bypass";
 import { formatRelativeTime } from "#/lib/format-relative-time";
 import {
+	approveWorkflowRuns,
 	deleteBranch,
 	dismissPullReview,
 	getCommentPage,
@@ -77,6 +81,7 @@ import {
 	mergePullRequest,
 	replyToReviewComment,
 	requestPullReviewers,
+	rerunChecks,
 	resolveReviewThread,
 	unresolveReviewThread,
 	updatePullBranch,
@@ -100,6 +105,7 @@ import type {
 	PullPageData,
 	PullReviewComment,
 	PullStatus,
+	PullWorkflowApproval,
 	TimelineEvent,
 } from "#/lib/github.types";
 import {
@@ -446,6 +452,7 @@ function MergeStatusCard({
 	const {
 		checks,
 		checkRuns,
+		pendingWorkflowApprovals,
 		reviews,
 		mergeable,
 		mergeableState,
@@ -464,7 +471,10 @@ function MergeStatusCard({
 
 	const hasReviewIssue = changesRequested.length > 0;
 	const allChecksPassed =
-		checks.total > 0 && checks.failed === 0 && checks.pending === 0;
+		checks.total > 0 &&
+		checks.failed === 0 &&
+		checks.pending === 0 &&
+		checks.expected === 0;
 	const hasCheckFailures = checks.failed > 0;
 	const isBehind = behindBy !== null && behindBy > 0;
 	const hasConflicts = mergeableState === "dirty";
@@ -489,12 +499,16 @@ function MergeStatusCard({
 			/>
 
 			{/* Checks section */}
-			{checks.total > 0 && (
+			{(checks.total > 0 || pendingWorkflowApprovals.length > 0) && (
 				<ChecksSection
 					checks={checks}
 					checkRuns={checkRuns}
+					pendingWorkflowApprovals={pendingWorkflowApprovals}
 					allChecksPassed={allChecksPassed}
 					hasCheckFailures={hasCheckFailures}
+					owner={owner}
+					repo={repo}
+					pullNumber={pullNumber}
 				/>
 			)}
 
@@ -737,15 +751,30 @@ function ReviewsSection({
 function ChecksSection({
 	checks,
 	checkRuns,
+	pendingWorkflowApprovals,
 	allChecksPassed,
 	hasCheckFailures,
+	owner,
+	repo,
+	pullNumber,
 }: {
 	checks: PullStatus["checks"];
 	checkRuns: PullCheckRun[];
+	pendingWorkflowApprovals: PullWorkflowApproval[];
 	allChecksPassed: boolean;
 	hasCheckFailures: boolean;
+	owner: string;
+	repo: string;
+	pullNumber: number;
 }) {
 	const [open, setOpen] = useState(true);
+	const [isRerunning, setIsRerunning] = useState(false);
+	const [isApproving, setIsApproving] = useState(false);
+	const queryClient = useQueryClient();
+
+	const pendingTotal = checks.pending + checks.expected;
+	const approvalCount = pendingWorkflowApprovals.length;
+	const isApprovalOnly = checks.total === 0 && approvalCount > 0;
 
 	const checkStatus: StatusType = allChecksPassed
 		? "success"
@@ -753,36 +782,137 @@ function ChecksSection({
 			? "error"
 			: "pending";
 
-	const title = allChecksPassed
-		? "All checks have passed"
-		: hasCheckFailures
-			? `${checks.failed} failing check${checks.failed > 1 ? "s" : ""}`
-			: `${checks.pending} pending check${checks.pending > 1 ? "s" : ""}`;
+	const title = isApprovalOnly
+		? `${approvalCount} workflow${approvalCount !== 1 ? "s" : ""} awaiting approval`
+		: allChecksPassed
+			? "All checks have passed"
+			: hasCheckFailures
+				? `${checks.failed} failing check${checks.failed > 1 ? "s" : ""}`
+				: `${pendingTotal} pending check${pendingTotal > 1 ? "s" : ""}`;
 
-	const parts: string[] = [];
-	if (checks.skipped > 0) parts.push(`${checks.skipped} skipped`);
-	parts.push(
-		`${checks.passed} successful check${checks.passed !== 1 ? "s" : ""}`,
-	);
-	if (checks.pending > 0) parts.push(`${checks.pending} pending`);
-	if (checks.failed > 0) parts.push(`${checks.failed} failing`);
-	const description = parts.join(", ");
+	let description: string;
+	if (isApprovalOnly) {
+		description = "Approve to run workflows and report checks.";
+	} else {
+		const parts: string[] = [];
+		if (checks.skipped > 0) parts.push(`${checks.skipped} skipped`);
+		parts.push(
+			`${checks.passed} successful check${checks.passed !== 1 ? "s" : ""}`,
+		);
+		if (checks.pending > 0) parts.push(`${checks.pending} pending`);
+		if (checks.expected > 0) parts.push(`${checks.expected} expected`);
+		if (checks.failed > 0) parts.push(`${checks.failed} failing`);
+		description = parts.join(", ");
+	}
 
-	// Sort: failed first, then pending, then skipped, then passed
-	const sortedRuns = [...checkRuns].sort((a, b) => {
-		const order = (run: PullCheckRun) => {
-			if (run.status !== "completed") return 1;
-			if (
-				run.conclusion === "failure" ||
-				run.conclusion === "timed_out" ||
-				run.conclusion === "cancelled"
-			)
-				return 0;
-			if (run.conclusion === "skipped") return 2;
-			return 3;
+	// Group by status in display order: expected, failed, pending, skipped, passed
+	const groupedRuns = useMemo(() => {
+		const groups: Record<
+			"expected" | "failure" | "pending" | "skipped" | "success",
+			PullCheckRun[]
+		> = {
+			expected: [],
+			failure: [],
+			pending: [],
+			skipped: [],
+			success: [],
 		};
-		return order(a) - order(b);
-	});
+		for (const run of checkRuns) {
+			groups[getCheckRunStatus(run)].push(run);
+		}
+		return groups;
+	}, [checkRuns]);
+
+	const checkRunGroups: Array<{
+		key: keyof typeof groupedRuns;
+		label: string;
+	}> = [
+		{ key: "expected", label: "Expected" },
+		{ key: "failure", label: "Failed" },
+		{ key: "pending", label: "Pending" },
+		{ key: "skipped", label: "Skipped" },
+		{ key: "success", label: "Passed" },
+	];
+
+	const handleRerun = async (failedOnly: boolean) => {
+		setIsRerunning(true);
+		try {
+			const result = await rerunChecks({
+				data: { owner, repo, pullNumber, failedOnly },
+			});
+			if (result.ok) {
+				const rerun = result.rerun ?? 0;
+				const skipped = result.skipped ?? 0;
+				const failed = result.failed ?? 0;
+				if (result.partial) {
+					toast.warning(
+						`Re-running ${rerun} check${rerun !== 1 ? "s" : ""}, but ${failed} failed`,
+					);
+				} else if (rerun > 0 && skipped > 0) {
+					toast.success(
+						`Re-running ${rerun} check${rerun !== 1 ? "s" : ""} · ${skipped} not eligible`,
+					);
+				} else if (rerun > 0) {
+					toast.success(`Re-running ${rerun} check${rerun !== 1 ? "s" : ""}`);
+				} else if (skipped > 0) {
+					toast.info("No checks are eligible for rerun");
+				}
+				await queryClient.invalidateQueries({ queryKey: ["github"] });
+			} else {
+				toast.error(result.error);
+				checkPermissionWarning(result, `${owner}/${repo}`);
+			}
+		} catch {
+			toast.error("Failed to rerun checks");
+		} finally {
+			setIsRerunning(false);
+		}
+	};
+
+	const handleApprove = async () => {
+		setIsApproving(true);
+		try {
+			const result = await approveWorkflowRuns({
+				data: {
+					owner,
+					repo,
+					pullNumber,
+					workflowRunIds: pendingWorkflowApprovals.map((a) => a.workflowRunId),
+				},
+			});
+			if (result.ok) {
+				if (result.partial) {
+					const approved = result.approved ?? 0;
+					const failed = result.failed ?? 0;
+					toast.warning(
+						`Approved ${approved} workflow${approved !== 1 ? "s" : ""}, but ${failed} failed`,
+					);
+				}
+				// Keep the button in loading state; the effect below resets it once the
+				// workflow_run webhook invalidates the cache and the pending list drains.
+				await queryClient.invalidateQueries({ queryKey: ["github"] });
+			} else {
+				toast.error(result.error);
+				checkPermissionWarning(result, `${owner}/${repo}`);
+				setIsApproving(false);
+			}
+		} catch {
+			toast.error("Failed to approve workflows");
+			setIsApproving(false);
+		}
+	};
+
+	// Reset the approving state when the pending list drains (webhook arrived) or
+	// after a safety timeout to avoid a permanently-stuck spinner.
+	useEffect(() => {
+		if (!isApproving) return;
+		if (pendingWorkflowApprovals.length === 0) {
+			setIsApproving(false);
+			return;
+		}
+		const timer = setTimeout(() => setIsApproving(false), 30_000);
+		return () => clearTimeout(timer);
+	}, [isApproving, pendingWorkflowApprovals.length]);
 
 	return (
 		<Collapsible open={open} onOpenChange={setOpen}>
@@ -807,56 +937,168 @@ function ChecksSection({
 					</div>
 				</button>
 			</CollapsibleTrigger>
+			{pendingWorkflowApprovals.length > 0 && (
+				<div className="flex items-start gap-3 border-b border-border/50 bg-surface-1/50 px-4 py-3">
+					<div className="mt-0.5 shrink-0 text-yellow-600 dark:text-yellow-400">
+						<AlertCircleIcon size={16} strokeWidth={2} />
+					</div>
+					<div className="flex min-w-0 flex-1 flex-col gap-0.5">
+						<p className="text-sm font-medium">
+							{pendingWorkflowApprovals.length} workflow
+							{pendingWorkflowApprovals.length !== 1 ? "s" : ""} awaiting
+							approval
+						</p>
+						<p className="text-xs text-muted-foreground">
+							This workflow requires approval from a maintainer.
+						</p>
+					</div>
+					<Button
+						size="xs"
+						variant="outline"
+						disabled={isApproving}
+						className="shrink-0"
+						iconLeft={isApproving ? <Spinner size={12} /> : undefined}
+						onClick={() => void handleApprove()}
+					>
+						Approve workflows to run
+					</Button>
+				</div>
+			)}
 			<CollapsibleContent>
-				<div className="flex max-h-64 flex-col overflow-y-auto border-b border-border/50 bg-surface-1/50 py-1">
-					{sortedRuns.map((run) => {
-						const runStatus = getCheckRunStatus(run);
+				<div className="flex max-h-64 flex-col overflow-y-auto border-b border-border/50 bg-surface-1/50">
+					{checkRunGroups.map(({ key, label }) => {
+						const runs = groupedRuns[key];
+						if (runs.length === 0) return null;
 						return (
-							<div
-								key={run.id}
-								className="flex items-center gap-2 px-4 py-1.5 pl-11"
-							>
-								<CheckRunIcon status={runStatus} />
-								{run.appAvatarUrl && (
-									<img
-										src={run.appAvatarUrl}
-										alt=""
-										className="size-4 shrink-0 rounded border border-border"
-									/>
-								)}
-								<span className="min-w-0 flex-1 truncate text-xs">
-									{run.name}
-									<span className="text-muted-foreground">
-										{runStatus === "pending" && run.startedAt
-											? ` — Started ${formatRelativeTime(run.startedAt)}`
-											: run.outputTitle
-												? ` — ${run.outputTitle}`
-												: null}
-									</span>
-								</span>
-								<span
-									className={cn(
-										"shrink-0 text-xs capitalize",
-										runStatus === "success" &&
-											"text-green-600 dark:text-green-400",
-										runStatus === "failure" && "text-red-600 dark:text-red-400",
-										runStatus === "pending" &&
-											"text-yellow-600 dark:text-yellow-400",
-										runStatus === "skipped" && "text-muted-foreground",
-									)}
-								>
-									{runStatus === "success"
-										? "Passed"
-										: runStatus === "failure"
-											? "Failed"
-											: runStatus === "pending"
-												? "Pending"
-												: "Skipped"}
-								</span>
+							<div key={key} className="flex flex-col py-1">
+								<div className="px-4 pt-1 pb-0.5 pl-11 text-[11px] font-medium text-muted-foreground">
+									{label}
+								</div>
+								{runs.map((run) => {
+									const runStatus = getCheckRunStatus(run);
+									const detail =
+										runStatus === "expected"
+											? "Waiting for status to be reported"
+											: runStatus === "pending" && run.startedAt
+												? `Started ${formatRelativeTime(run.startedAt)}`
+												: run.outputTitle;
+									const nameContent = (
+										<>
+											<span>{run.name}</span>
+											{detail && (
+												<span className="text-muted-foreground">
+													{" — "}
+													{detail}
+												</span>
+											)}
+										</>
+									);
+									return (
+										<div
+											key={`${run.name}:${run.id}`}
+											className="group/run flex items-center gap-2 px-4 py-1.5 pl-11"
+										>
+											<CheckRunIcon status={runStatus} />
+											{run.appAvatarUrl && (
+												<img
+													src={run.appAvatarUrl}
+													alt=""
+													className="size-4 shrink-0 rounded border border-border"
+												/>
+											)}
+											{run.htmlUrl ? (
+												<a
+													href={run.htmlUrl}
+													target="_blank"
+													rel="noopener noreferrer"
+													className="min-w-0 flex-1 truncate text-xs hover:underline"
+												>
+													{nameContent}
+												</a>
+											) : (
+												<span className="min-w-0 flex-1 truncate text-xs">
+													{nameContent}
+												</span>
+											)}
+											{run.required && (
+												<StatePill
+													tone="secondary"
+													className="-my-0.5 !text-[10px]"
+												>
+													Required
+												</StatePill>
+											)}
+											<span
+												className={cn(
+													"shrink-0 text-xs capitalize",
+													runStatus === "success" &&
+														"text-green-600 dark:text-green-400",
+													runStatus === "failure" &&
+														"text-red-600 dark:text-red-400",
+													runStatus === "pending" &&
+														"text-yellow-600 dark:text-yellow-400",
+													runStatus === "expected" &&
+														"text-yellow-600 dark:text-yellow-400",
+													runStatus === "skipped" && "text-muted-foreground",
+												)}
+											>
+												{runStatus === "success"
+													? "Passed"
+													: runStatus === "failure"
+														? "Failed"
+														: runStatus === "pending"
+															? "Pending"
+															: runStatus === "expected"
+																? "Expected"
+																: "Skipped"}
+											</span>
+										</div>
+									);
+								})}
 							</div>
 						);
 					})}
 				</div>
+				{(hasCheckFailures || checks.total > 0) && (
+					<div className="flex items-center gap-2 border-b border-border/50 bg-surface-1/50 px-4 py-1.5 pl-11">
+						{hasCheckFailures && (
+							<Button
+								variant="ghost"
+								size="xs"
+								disabled={isRerunning}
+								className="h-6 text-xs text-muted-foreground"
+								iconLeft={
+									isRerunning ? (
+										<Spinner size={12} />
+									) : (
+										<RefreshCwIcon size={12} strokeWidth={2} />
+									)
+								}
+								onClick={() => void handleRerun(true)}
+							>
+								Re-run failed checks
+							</Button>
+						)}
+						{checks.total > 0 && (
+							<Button
+								variant="ghost"
+								size="xs"
+								disabled={isRerunning}
+								className="h-6 text-xs text-muted-foreground"
+								iconLeft={
+									isRerunning ? (
+										<Spinner size={12} />
+									) : (
+										<RefreshCwIcon size={12} strokeWidth={2} />
+									)
+								}
+								onClick={() => void handleRerun(false)}
+							>
+								Re-run all checks
+							</Button>
+						)}
+					</div>
+				)}
 			</CollapsibleContent>
 		</Collapsible>
 	);
@@ -1296,7 +1538,7 @@ function StatusIcon({ status }: { status: StatusType }) {
 function CheckRunIcon({
 	status,
 }: {
-	status: "success" | "failure" | "pending" | "skipped";
+	status: "success" | "failure" | "pending" | "skipped" | "expected";
 }) {
 	if (status === "success") {
 		return (
@@ -1316,6 +1558,13 @@ function CheckRunIcon({
 		return (
 			<div className="flex size-3.5 shrink-0 items-center justify-center text-muted-foreground">
 				<div className="size-1.5 rounded-full border border-current" />
+			</div>
+		);
+	}
+	if (status === "expected") {
+		return (
+			<div className="flex size-3.5 shrink-0 items-center justify-center text-yellow-500">
+				<div className="size-1.5 rounded-full bg-current" />
 			</div>
 		);
 	}
@@ -1348,11 +1597,13 @@ function CheckRunIcon({
 
 function getCheckRunStatus(
 	run: PullCheckRun,
-): "success" | "failure" | "pending" | "skipped" {
-	if (run.status !== "completed") return "pending";
+): "success" | "failure" | "pending" | "skipped" | "expected" {
+	if (run.status === "expected") return "expected";
+	if (run.status !== "completed" || run.conclusion === null) return "pending";
 	if (run.conclusion === "success" || run.conclusion === "neutral")
 		return "success";
-	if (run.conclusion === "skipped") return "skipped";
+	if (run.conclusion === "skipped" || run.conclusion === "stale")
+		return "skipped";
 	return "failure";
 }
 
