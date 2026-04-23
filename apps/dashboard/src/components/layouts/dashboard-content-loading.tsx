@@ -7,3 +7,11 @@ export function DashboardContentLoading() {
 		</div>
 	);
 }
+
+export function DashboardViewportLoading() {
+	return (
+		<div className="flex min-h-dvh items-center justify-center bg-background">
+			<Spinner size={20} className="text-muted-foreground" />
+		</div>
+	);
+}
