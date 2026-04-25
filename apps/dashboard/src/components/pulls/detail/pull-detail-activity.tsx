@@ -82,6 +82,7 @@ import {
 	dismissPullReview,
 	getCommentPage,
 	getTimelineEventPage,
+	markPullReadyForReview,
 	mergePullRequest,
 	replyToReviewComment,
 	requestPullReviewers,
@@ -254,6 +255,8 @@ export function PullDetailActivitySection({
 						pullNumber={pullNumber}
 						prTitle={pr.title}
 						firstCommitMessage={commits?.[0]?.message}
+						isDraft={pr.isDraft}
+						pullId={pr.graphqlId}
 					/>
 				</div>
 			)}
@@ -328,6 +331,8 @@ function MergeStatusSection({
 	pullNumber,
 	prTitle,
 	firstCommitMessage,
+	isDraft,
+	pullId,
 }: {
 	scope: GitHubQueryScope;
 	owner: string;
@@ -335,6 +340,8 @@ function MergeStatusSection({
 	pullNumber: number;
 	prTitle: string;
 	firstCommitMessage?: string;
+	isDraft: boolean;
+	pullId: string | undefined;
 }) {
 	const input = useMemo(
 		() => ({ owner, repo, pullNumber }),
@@ -389,6 +396,8 @@ function MergeStatusSection({
 			pullNumber={pullNumber}
 			prTitle={prTitle}
 			firstCommitMessage={firstCommitMessage}
+			isDraft={isDraft}
+			pullId={pullId}
 		/>
 	);
 }
@@ -486,6 +495,8 @@ function MergeStatusCard({
 	pullNumber,
 	prTitle,
 	firstCommitMessage,
+	isDraft,
+	pullId,
 }: {
 	scope: GitHubQueryScope;
 	status: PullStatus;
@@ -494,6 +505,8 @@ function MergeStatusCard({
 	pullNumber: number;
 	prTitle: string;
 	firstCommitMessage?: string;
+	isDraft: boolean;
+	pullId: string | undefined;
 }) {
 	const {
 		checks,
@@ -585,18 +598,27 @@ function MergeStatusCard({
 				/>
 			)}
 
-			{/* Merge action footer */}
-			<MergeFooter
-				scope={scope}
-				isMergeBlocked={isMergeBlocked}
-				canMerge={canMerge}
-				bypass={bypass}
-				owner={owner}
-				repo={repo}
-				pullNumber={pullNumber}
-				prTitle={prTitle}
-				firstCommitMessage={firstCommitMessage}
-			/>
+			{/* Merge action footer (or "ready for review" CTA when draft) */}
+			{isDraft ? (
+				<ReadyForReviewFooter
+					owner={owner}
+					repo={repo}
+					pullNumber={pullNumber}
+					pullId={pullId}
+				/>
+			) : (
+				<MergeFooter
+					scope={scope}
+					isMergeBlocked={isMergeBlocked}
+					canMerge={canMerge}
+					bypass={bypass}
+					owner={owner}
+					repo={repo}
+					pullNumber={pullNumber}
+					prTitle={prTitle}
+					firstCommitMessage={firstCommitMessage}
+				/>
+			)}
 		</div>
 	);
 }
@@ -1326,6 +1348,71 @@ function UpdateBranchButton({
 					</DropdownMenuItem>
 				</DropdownMenuContent>
 			</DropdownMenu>
+		</div>
+	);
+}
+
+// ── Ready for review footer ─────────────────────────────────────────
+
+function ReadyForReviewFooter({
+	owner,
+	repo,
+	pullNumber,
+	pullId,
+}: {
+	owner: string;
+	repo: string;
+	pullNumber: number;
+	pullId: string | undefined;
+}) {
+	const [isMarking, setIsMarking] = useState(false);
+	const queryClient = useQueryClient();
+
+	const handleMarkReady = async () => {
+		if (!pullId) {
+			toast.error("Missing pull request id");
+			return;
+		}
+		setIsMarking(true);
+		try {
+			const result = await markPullReadyForReview({
+				data: { owner, repo, pullNumber, pullId },
+			});
+			if (result.ok) {
+				await queryClient.invalidateQueries({ queryKey: ["github"] });
+			} else {
+				toast.error(result.error);
+				checkPermissionWarning(result, `${owner}/${repo}`);
+				setIsMarking(false);
+			}
+		} catch {
+			toast.error("Failed to mark as ready for review");
+			setIsMarking(false);
+		}
+	};
+
+	return (
+		<div className="flex items-center gap-3 px-4 py-3">
+			<Button
+				size="sm"
+				disabled={isMarking || !pullId}
+				onClick={() => {
+					void handleMarkReady();
+				}}
+				iconLeft={
+					isMarking ? (
+						<Spinner size={14} />
+					) : (
+						<GitPullRequestIcon size={14} strokeWidth={2} />
+					)
+				}
+			>
+				Ready for review
+			</Button>
+			<p className="text-xs text-muted-foreground">
+				This pull request is a draft. Mark it as ready for review to allow
+				merging.
+			</p>
 		</div>
 	);
 }
