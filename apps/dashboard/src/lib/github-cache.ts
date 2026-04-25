@@ -557,6 +557,78 @@ export async function markGitHubRevalidationSignals(
 	return uniqueSignalKeys.length;
 }
 
+export type GitHubWebhookEventRecord = {
+	deliveryId: string;
+	event: string;
+	signalKeys: string[];
+	receivedAt?: number;
+};
+
+/**
+ * Records a webhook delivery for audit and replay. Idempotent on deliveryId —
+ * GitHub retries reuse the same X-GitHub-Delivery header, so only the first
+ * attempt persists. Returns true when a new row was inserted.
+ */
+export async function recordGitHubWebhookEvent({
+	deliveryId,
+	event,
+	signalKeys,
+	receivedAt = Date.now(),
+}: GitHubWebhookEventRecord) {
+	const [{ getDb }, { githubWebhookEvent }] = await Promise.all([
+		import("../db"),
+		import("../db/schema"),
+	]);
+	const db = getDb();
+
+	const inserted = await db
+		.insert(githubWebhookEvent)
+		.values({
+			deliveryId,
+			event,
+			signalKeysJson: JSON.stringify(signalKeys),
+			receivedAt,
+		})
+		.onConflictDoNothing({ target: githubWebhookEvent.deliveryId })
+		.returning({ id: githubWebhookEvent.id });
+
+	return inserted.length > 0;
+}
+
+export async function markGitHubWebhookEventProcessed(
+	deliveryId: string,
+	at = Date.now(),
+) {
+	const [{ eq }, { getDb }, { githubWebhookEvent }] = await Promise.all([
+		import("drizzle-orm"),
+		import("../db"),
+		import("../db/schema"),
+	]);
+	const db = getDb();
+
+	await db
+		.update(githubWebhookEvent)
+		.set({ processedAt: at, errorMessage: null })
+		.where(eq(githubWebhookEvent.deliveryId, deliveryId));
+}
+
+export async function markGitHubWebhookEventFailed(
+	deliveryId: string,
+	errorMessage: string,
+) {
+	const [{ eq }, { getDb }, { githubWebhookEvent }] = await Promise.all([
+		import("drizzle-orm"),
+		import("../db"),
+		import("../db/schema"),
+	]);
+	const db = getDb();
+
+	await db
+		.update(githubWebhookEvent)
+		.set({ errorMessage: errorMessage.slice(0, 2000) })
+		.where(eq(githubWebhookEvent.deliveryId, deliveryId));
+}
+
 export async function getGitHubRevalidationSignals(signalKeys: string[]) {
 	if (signalKeys.length === 0) {
 		return [];
@@ -589,6 +661,64 @@ export async function bustGitHubCache(
 	const paramsJson = stableSerialize(params);
 	const cacheKey = buildGitHubCacheKey({ userId, resource, paramsJson });
 	await store.delete(cacheKey);
+}
+
+async function getGitHubCacheKvNamespace(): Promise<KVNamespace | null> {
+	try {
+		const { env } = await import("cloudflare:workers");
+		const workerEnv = env as typeof env & {
+			GITHUB_CACHE_KV?: KVNamespace;
+		};
+		return workerEnv.GITHUB_CACHE_KV ?? null;
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * Drops every cached GitHub response that belongs to the user. Clears legacy
+ * D1 rows (response cache) and best-effort sweeps the KV split-mode payload
+ * store keyed by `gh:${userId}:`. Global signal/namespace tables are left
+ * alone so other users keep their state.
+ */
+export async function clearAllGitHubCacheForUser(userId: string) {
+	const [{ eq }, { getDb }, { githubResponseCache }] = await Promise.all([
+		import("drizzle-orm"),
+		import("../db"),
+		import("../db/schema"),
+	]);
+	const db = getDb();
+
+	const deletedDbRows = await db
+		.delete(githubResponseCache)
+		.where(eq(githubResponseCache.userId, userId))
+		.returning({ cacheKey: githubResponseCache.cacheKey });
+
+	let deletedKvKeys = 0;
+	const kv = await getGitHubCacheKvNamespace();
+	if (kv) {
+		const prefix = `gh:${userId}:`;
+		let cursor: string | undefined;
+
+		do {
+			const result: KVNamespaceListResult<unknown, string> = await kv.list({
+				prefix,
+				cursor,
+			});
+
+			if (result.keys.length > 0) {
+				await Promise.all(result.keys.map((key) => kv.delete(key.name)));
+				deletedKvKeys += result.keys.length;
+			}
+
+			cursor = result.list_complete ? undefined : result.cursor;
+		} while (cursor);
+	}
+
+	return {
+		deletedDbRows: deletedDbRows.length,
+		deletedKvKeys,
+	};
 }
 
 export function createGitHubResponseMetadata(

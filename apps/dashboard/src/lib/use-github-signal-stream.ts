@@ -27,9 +27,13 @@ function isSignalMessage(data: unknown): data is SignalMessage {
 }
 
 const RECONNECT_DELAY_MS = 3_000;
-/** Fallback when WebSocket misses — keep "My" lists reasonably fresh */
-const POLL_INTERVAL_MS = 90 * 1_000;
-const RESUME_SYNC_MIN_INTERVAL_MS = 5_000;
+/**
+ * Safety net for missed WebSocket broadcasts. Tight enough that a dropped
+ * signal surfaces within ~20 s; the work itself is one indexed lookup keyed
+ * by the (small) set of signal keys the page subscribes to.
+ */
+const POLL_INTERVAL_MS = 20 * 1_000;
+const RESUME_SYNC_MIN_INTERVAL_MS = 2_000;
 
 export function getGitHubDataFetchedAt(value: unknown): number | null {
 	if (!value || typeof value !== "object" || !("__meta" in value)) {
@@ -198,10 +202,13 @@ function collectKeysToInvalidateAfterServerSync(
 			);
 
 			if (lastSeen === undefined) {
-				if (
-					typeof freshnessTimestamp === "number" &&
-					signal.updatedAt > freshnessTimestamp
-				) {
+				if (typeof freshnessTimestamp !== "number") {
+					// Query is still loading — defer recording until we can compare
+					// against the cached payload's fetchedAt. Otherwise a webhook that
+					// fired before mount would be silently absorbed and never invalidate.
+					continue;
+				}
+				if (signal.updatedAt > freshnessTimestamp) {
 					updatedKeys.add(signal.signalKey);
 				}
 				lastSeenTimestamps.set(compositeKey, signal.updatedAt);
