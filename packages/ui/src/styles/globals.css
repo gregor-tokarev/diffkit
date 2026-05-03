@@ -184,24 +184,30 @@
 button:not(:disabled):not([aria-disabled="true"]):not([data-disabled]):not(
 		[data-disabled="true"]
 	),
-a[href],
+a[href]:not([disabled]):not([aria-disabled="true"]):not([data-disabled]):not(
+		[data-disabled="true"]
+	),
 input[type="button"]:not(:disabled):not([aria-disabled="true"]):not(
-		[data-disabled="true"]
-	),
+		[data-disabled]
+	):not([data-disabled="true"]),
 input[type="checkbox"]:not(:disabled):not([aria-disabled="true"]):not(
-		[data-disabled="true"]
-	),
+		[data-disabled]
+	):not([data-disabled="true"]),
 input[type="radio"]:not(:disabled):not([aria-disabled="true"]):not(
-		[data-disabled="true"]
-	),
+		[data-disabled]
+	):not([data-disabled="true"]),
 input[type="reset"]:not(:disabled):not([aria-disabled="true"]):not(
-		[data-disabled="true"]
-	),
+		[data-disabled]
+	):not([data-disabled="true"]),
 input[type="submit"]:not(:disabled):not([aria-disabled="true"]):not(
+		[data-disabled]
+	):not([data-disabled="true"]),
+label[for]:not([disabled]):not([aria-disabled="true"]):not([data-disabled]):not(
 		[data-disabled="true"]
 	),
-label[for],
-summary,
+summary:not([disabled]):not([aria-disabled="true"]):not([data-disabled]):not(
+		[data-disabled="true"]
+	),
 [role="button"]:not([aria-disabled="true"]):not([data-disabled]):not(
 		[data-disabled="true"]
 	),
